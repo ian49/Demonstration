@@ -1,0 +1,406 @@
+---
+title: "Demonstration"
+author: "mutwiri_ian@yahoo.com"
+date: "`r format(Sys.time(), '%d %B,%Y')`"
+output: [github_document,pdf_document]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE,warning = FALSE)
+ggplot2::theme_set(ggplot2::theme_minimal())
+```
+
+This is a demonstrative project I have worked to demonstrate my data analysis, machine learning and R skills. I use data obtained from the UCL machine learning archive(https://archive-beta.ics.uci.edu/ml/datasets/predict+students+dropout+and+academic+success) on student dropout rates and academic success in Portugal. The target variable in this case is whether the student finally enrolled, dropped out or graduated.
+
+I extensively leverage the `Tidyverse` ecosystem for data importing, wrangling and visualization and the `Tidymodels` set of package to develop a machine learning pipeline. Lets get into it by first loading the `Tidyverse` package and reading in the data.
+```{r Load package and data}
+library(tidyverse)
+#Data is in working directory and semi-colon delimited
+students <- read_delim(file = 'students.csv',delim = ";")
+
+```
+Now we can begin analyzing the data by doing some basic exploratory visualisations that can help us 'see' the data and draw insights. since the target variable is discrete, we can examine how the data is distributed and check for imbalance in some categories.
+
+There seems to be some severe imbalance in the data particularly towards the `Graduate` category.
+```{r}
+students %>% 
+  count(Target) %>% 
+  kableExtra::kable()
+
+```
+By inspection of the density plots, it appears that the data is fairly normally distributed across the `Target` levels which is good for modelling.
+```{r}
+students %>% 
+  ggplot(aes(`Admission grade`))+
+  geom_density(aes(fill=Target),alpha=.7)+
+  labs(
+    title = 'Distribution of admission grades for students by the final outcome',
+    y='Density'
+    
+  )
+```
+Visual inspection implies there is difference betweeen the mean and the variance of admission grades across all `Target` categories which is confirmed by performing a formal satistical tests.
+```{r}
+students %>% 
+  ggplot(aes(Target,`Admission grade`))+
+  geom_boxplot(aes(fill=Target),show.legend = F)+
+  labs(
+    title = 'Admission grades by Target'
+  )+
+  xlab('')
+```
+```{r}
+summary(aov(`Admission grade`~Target,data = students))
+```
+
+```{r}
+bartlett.test(`Admission grade`~Target,data = students)
+
+```
+Fathers' qualification are arguably higher for all `Target` categories compared to mother's qualification.
+```{r}
+students %>% 
+  select(Target,`Mother's qualification`,`Father's qualification`) %>% 
+  rename(mom_qual=`Mother's qualification`,
+         dad_qual=`Father's qualification`) %>% 
+  group_by(Target) %>% 
+  summarise(Mean_Mothers_qual=mean(mom_qual),
+            Mean_Fathers_qual=mean(dad_qual)) %>% 
+  kableExtra::kable()
+```
+Exploring the difference between students who attend regular and evening classes shows that most students taking evening classes end up graduating as compared to to students attending day-time classes. Moreover,students attending daytime classes are more likely to dropout.
+```{r}
+plotdata<- students %>% 
+    mutate(day_even_att=factor(`Daytime/evening attendance	`),
+           Target=factor(Target)) %>% 
+  select(`Daytime/evening attendance	`,Target)%>% 
+  group_by(`Daytime/evening attendance	`,Target) %>% 
+  summarise(n=n()) %>% 
+  mutate(pct=n/sum(n),lbl=scales::percent(pct))
+
+plotdata %>% 
+  ggplot(aes(`Daytime/evening attendance	`,pct,fill=Target))+
+  geom_bar(stat = 'identity',position = 'fill')+
+    scale_x_discrete(limits=c(0,1))+
+  scale_y_continuous(breaks  = seq(0,1,.2),labels = scales::percent)+
+  geom_text(aes(label=lbl),
+            position = position_stack(vjust = .5))+
+  scale_fill_brewer(palette = 'Dark2')+
+  ylab('')
+
+```
+Most students enrolled are in their early 20's followed by those in their late 20's.
+```{r}
+students %>% 
+ggplot(aes(`Age at enrollment`))+
+geom_histogram(fill='Midnightblue')+
+  labs(
+    title = "Frequency distribution of students' age"
+  )
+```
+This is confirmed across the `Target` variable with most dispersion in the those that end up graduating.
+```{r}
+students %>% 
+  ggplot() + 
+  geom_violin(aes(Target,`Age at enrollment`,fill=Target))+
+  scale_fill_viridis_d(option = 'cividis')
+```
+The first semester and second semester correlation is relatively high and statistically significant. Of course correlation does not imply causation.
+```{r}
+grades<- students %>% 
+  select(starts_with('curricular')&ends_with('(grade)'),Target) %>% 
+  janitor::clean_names() %>%
+  rename(first_sem=curricular_units_1st_sem_grade,
+         second_sem=curricular_units_2nd_sem_grade) %>% 
+  filter(first_sem>0 & second_sem>0) 
+r <- cor(grades$first_sem,grades$second_sem)
+grades %>% 
+  ggplot(aes(first_sem,second_sem))+
+  geom_point(aes(col=target),size=2,alpha=.6)+
+  annotate('text',x=18,y=15,label=paste0('r=',round(r,2)))+
+  labs(title = 'Curriculum units grades for the first and second semester units',
+       x='First semester',y='Second semester')
+```
+We could also explore day time and evening class attendance across both genders.
+In both genders, the average age is higher for students who attend evening classes compared to those who attend daytime classes.
+
+```{r}
+students %>% 
+  select(Gender,`Daytime/evening attendance	`,`Age at enrollment`) %>%
+  mutate_at(vars(1,2),factor) %>% 
+  janitor::clean_names() %>% 
+  group_by(gender,daytime_evening_attendance)%>%
+  summarise(avg_age=mean(age_at_enrollment)) %>% 
+  kableExtra::kable()
+```
+Now we can get on building a machine learning model(s) that we will use to predict the `Target` class. Both `caret` and `Tidymodels` work just fine but I will use the later for now.
+A machine learning model is meant to predict as accurately as possible new data after learning from the training data. To this effect, we split the full data into a training set, which we will use to train our model(s), and a testing set, on which we evaluate the performance of our model.
+
+I choose to split the data on a 80/20 basis and stratifying on the `Target` variable so as to ensure that the distribution of categories is similar in both the training and testing data. 
+```{r}
+library(tidymodels)
+students <- students %>% 
+  mutate_if(is.character,factor) %>% 
+  mutate_at(vars(c(1,3,5,8,14:19,21)),factor) %>% 
+  janitor::clean_names()
+
+set.seed(7577)
+students_split <- initial_split(students,prop = .8,strata = target)
+students_train <- training(students_split)
+students_test <- testing(students_split)
+```
+
+Because the performance of the model can only be evaluated with the testing data,until then we need to figure out a way of assessing the performance of our model in the training process. We can do this by cross-validation;we randomly sample observations in the training data that we will use to build the model and use the remaining observations to assess the performance of the model. We can do this repeatedly,5 or 10 times, and average these results to get an estimate how our model would perform in production.
+```{r}
+students_folds <- vfold_cv(students_train,v = 10,strata = target)
+students_folds
+```
+To prepare the data for modelling, the `recipes` package comes in handy by providing some pre-processing steps like dummy-encoding of categorical variables and removal of redundant variables with the `step_zv()` function.
+```{r Prepare recipes}
+students_rec<- recipe(target~.,data = students_train) %>% 
+  themis::step_downsample(target) %>% 
+  step_dummy(all_nominal(),-all_outcomes()) %>% 
+  step_zv(all_numeric()) %>% 
+  step_normalize(all_numeric()) %>% 
+  prep()
+```
+
+We then specify the models that we are will attempt to fit to the data and select the best among these. I choose to work with a multinomial regression model, a random forest and a support vector classifier.
+```{r Model specs}
+multi_spec <- multinom_reg() %>% 
+  set_engine('nnet') %>% 
+  set_mode('classification')
+
+rf_spec <- rand_forest(trees = 1000) %>% 
+  set_engine('ranger',importance = "impurity") %>% 
+    set_mode('classification')
+
+svm_spec <- svm_rbf() %>% 
+  set_engine('kernlab') %>% 
+    set_mode('classification')
+```
+
+Using the recipe and the cross-validation folds that were previously created, we can then fit all these model specifications to the folds/resamples and then evaluate their performance.
+```{r}
+multi_rs<- fit_resamples(
+  multi_spec,
+  students_rec,
+  students_folds,
+  control=control_resamples(save_pred = T)
+)
+
+rf_rs<- fit_resamples(
+  rf_spec,
+  students_rec,
+  students_folds,
+  control=control_resamples(save_pred = T)
+)
+
+svm_rs<- fit_resamples(
+  svm_spec,
+  students_rec,
+  students_folds,
+  control=control_resamples(save_pred = T)
+)
+```
+
+
+```{r}
+multi_rs %>% 
+  mutate(model='Multinomial') %>% 
+  bind_rows(rf_rs %>% 
+              mutate(model='Random Forest')) %>% 
+  bind_rows(svm_rs %>% mutate(model="SVM")) %>% 
+  unnest(.predictions) %>% 
+  group_by(model) %>% 
+  roc_curve(target,.pred_Dropout:.pred_Graduate) %>% 
+  ggplot(aes(1-specificity,sensitivity,color=model))+
+  geom_abline(slope = 1,lty=2,color='gray50',alpha=.8)+
+  geom_path(size=1.5,alpha=.7)+
+  labs(model=NULL)+
+  coord_fixed()
+```
+
+The performance of the three models is not so different(84% overall accuracy) and I would choose to work with the logistic regression model as it is less complex and easier to interpret compared to the random forest and the support vector classifier which are like black boxes.
+```{r}
+multi_rs %>% 
+  collect_metrics() %>% 
+  mutate(model='logistic') %>% 
+  bind_rows(
+    rf_rs %>% 
+      collect_metrics() %>% 
+      mutate(model='rf')
+  ) %>% 
+  bind_rows(
+    svm_rs %>% 
+      collect_metrics() %>% 
+      mutate(model='svm')
+  ) %>% 
+  select(model,.metric,mean)
+```
+However,these models have model-specific parameters(hyperparameters) that can be tweaked so as to match the structure of the data and improve accuracy. With random forests we can tune the number of trees to construct, the number of variables to split on and the minimum number of elements that each node should contain while the support vector classifier with a radial basis kernel function has a cost-complexity parameter which controls for the amount of overlap allowed by the classifier. We will update the model specifications so that we are able to tune these parameters.
+
+We can combine the the recipe and the model specificatons into a workflow and the tune these hyperparameters. But first we need to update these model specifications so that these hyperparameters are tunable.
+```{r}
+multi_spec <- multi_spec %>% 
+  update(mixture=tune())
+
+rf_spec <- rf_spec %>% 
+  update(mtry=tune(),min_n=tune())
+
+svm_spec <- svm_spec %>% 
+  update(cost=tune())
+
+students_set<- workflow_set(
+  list(students_rec),
+  list(Multinomial=multi_spec,Random_forest=rf_spec,SVM=svm_spec),
+  cross = F
+) 
+```
+
+These models are computationally intensive so we register a parallel processing back-end to speed up the process
+```{r}
+cl <- parallel::makePSOCKcluster(2)
+doParallel::registerDoParallel(cl)
+```
+
+I set the number of parameters to tune across as 5 which are selected by a space-fill design. The models with these combinations of hyperparameters are trained across the 10 cross-validation folds. I apply a bayesian optimization technique which does not fit all models across all parameters and removes parameters for which the models has poor performance.
+```{r}
+#Use a space-fill design to select parameter values
+students_rs<- workflow_map(
+  students_set,
+  "tune_grid",
+  resamples = students_folds,
+  grid=5,
+  metrics = metric_set(roc_auc,accuracy),
+  seed = 7578,verbose = T,
+  control = control_resamples(save_pred = T)
+)
+students_rs
+```
+We can also visualize the performance profile of the models across the tuning parameters.
+```{r}
+students_rs %>% 
+  collect_metrics()
+  
+```
+
+We can also check for the best model by ranking the models by the overall accuracy rate, by the area under the ROC curve or by a quick visualization.
+```{r}
+students_rs %>% 
+  collect_metrics(metric='roc_auc')
+```
+```{r}
+students_rs %>% 
+  autoplot()
+```
+The random forest model performs better the rest of the models.
+
+We can also examine how the performance of the models across the hyperparameters. First, the random forest model 
+```{r}
+students_rs %>% 
+  extract_workflow_set_result(id = "recipe_Random_forest") %>% 
+  autoplot()
+```
+and the support vector classifier.
+```{r}
+students_rs %>% 
+  extract_workflow_set_result(id = "recipe_SVM") %>% 
+  autoplot()
+```
+We see that models perform best within some range of these hyperparameters. we can 'zoom in' update these hyperparameters to achieve a higher level of accuracy. I use a space-fill desin, the maximum entropy design, which covers our parameter range with low chance of redundant values.
+
+```{r}
+hype_grid<- grid_max_entropy(mixture(range =  c(0,1)),
+mtry(range = c(10,37)),
+min_n(range = c(20,35)),
+cost(range = c(.25,4)),size = 20)
+```
+
+...and re-run our models.
+```{r}
+students_rs<- workflow_map(
+  students_set,
+  "tune_grid",
+  resamples = students_folds,
+  grid=hype_grid,
+  metrics = metric_set(roc_auc,accuracy),
+  seed = 7578,verbose = T,
+  control = control_resamples(save_pred = T)
+)
+students_rs
+```
+We can then rank the results and check if the performance of the models has improved
+```{r}
+students_rs %>% 
+  rank_results(rank_metric = "roc_auc")
+```
+
+```{r}
+students_rs %>% 
+  autoplot()
+```
+We see that the model in the workflow corresponding to a random forest is the best among all other models evaluated. We can extract this workflow  together with the best model and use it to make predictions for new data. To do this we fit the best model to the training data and then evaluate its performance on the testing data. We can then get an idea of how accurately this model predicts on new data.
+
+```{r}
+best_model<- students_rs %>% 
+  extract_workflow_set_result("recipe_Random_forest") %>% 
+  select_best(metric = 'roc_auc')
+
+best_fit<- students_rs %>% 
+  extract_workflow("recipe_Random_forest") %>% 
+  finalize_workflow(best_model) %>% 
+  last_fit(students_split)
+
+best_fit %>% collect_metrics()
+```
+It performs worse but does not severely deviate from the expected performance. There is some over-fitting but the can be reduced with more computational power and expert domain knowledge(context).
+
+We can also visualize a confusion matrix for the class prediction
+```{r include=F}
+update_geom_defaults(geom = 'rect',new = list(fill='midnightblue',alpha=.7))
+```
+
+```{r}
+best_fit %>% 
+  collect_predictions() %>% 
+  conf_mat(target,.pred_class) %>% 
+  autoplot() 
+```
+and ROC curves for each class.
+```{r}
+best_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(truth = target,.pred_Dropout:.pred_Graduate) %>% 
+  ggplot(aes(1-specificity,sensitivity,color=.level))+
+  geom_abline(slope = 1,color='gray80',lty=2,alpha=.8)+
+  geom_path(size=1,alpha=.7)+
+  labs(color=NULL)+
+  coord_fixed()
+```
+Our model predicts the Graduate class better than any other class.
+
+We can randomly select an observation from our data and use our model to make a prediction for the class as follows
+```{r}
+best_fit %>% 
+  extract_workflow() %>% 
+  predict(new_data = students %>% slice_sample())
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
